@@ -813,17 +813,23 @@ void TinyUsbCdcService::configureCH340SerialPort(uint32_t baud_rate) {
     // Request 0x9A: Set baud rate
     uint16_t baud_reg = 0;
     switch (baud_rate) {
-        case 2400:   baud_reg = 0xD901; break;
-        case 4800:   baud_reg = 0x6402; break;
-        case 9600:   baud_reg = 0xB202; break;
-        case 19200:  baud_reg = 0xD902; break;
-        case 38400:  baud_reg = 0x6403; break;
-        case 57600:  baud_reg = 0x9803; break;
-        case 115200: baud_reg = 0xCC03; break;
-        case 230400: baud_reg = 0xE603; break;
-        case 460800: baud_reg = 0xF303; break;
-        case 921600: baud_reg = 0xF904; break;
-        default:     baud_reg = 0xCC03; break; // 默认115200
+        case 2400:    baud_reg = 0xD901; break;
+        case 4800:    baud_reg = 0x6402; break;
+        case 9600:    baud_reg = 0xB202; break;
+        case 19200:   baud_reg = 0xD902; break;
+        case 38400:   baud_reg = 0x6403; break;
+        case 57600:   baud_reg = 0x9803; break;
+        case 115200:  baud_reg = 0xCC03; break;
+        case 230400:  baud_reg = 0xE603; break;
+        case 460800:  baud_reg = 0xF303; break;
+        case 921600:  baud_reg = 0xF904; break;
+        case 1000000: baud_reg = 0xFA04; break;  // [修复问题2] 新增1M波特率支持
+        case 1500000: baud_reg = 0xFB04; break;  // [修复问题2] 新增1.5M波特率支持  
+        case 2000000: baud_reg = 0xFC04; break;  // [修复问题2] 新增2M波特率支持
+        default:      
+            ESP_LOGW(TAG, "Unsupported baud rate %lu for CH340, using 115200", baud_rate);
+            baud_reg = 0xCC03; 
+            break; // 默认115200
     }
     
     esp_err_t ret = cdc_acm_host_send_custom_request(

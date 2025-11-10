@@ -475,8 +475,51 @@ void UARTTTL::onButtonSettingsApplyClicked(lv_event_t *e)
     // 保存配置到NVS
     app->saveSettings();
     
-    // 重新配置UART服务
-    app->_uart_service.reconfigure(app->_current_config);
+    // [修复问题1] 智能重配置UART服务
+    ESP_LOGI(TAG, "Applying new UART configuration: %d %d%s%d", 
+             app->_current_config.baud_rate,
+             (app->_current_config.data_bits == UART_DATA_8_BITS) ? 8 : 
+             (app->_current_config.data_bits == UART_DATA_7_BITS) ? 7 : 
+             (app->_current_config.data_bits == UART_DATA_6_BITS) ? 6 : 5,
+             (app->_current_config.parity == UART_PARITY_DISABLE) ? "N" :
+             (app->_current_config.parity == UART_PARITY_EVEN) ? "E" : "O",
+             (app->_current_config.stop_bits == UART_STOP_BITS_1) ? 1 : 2);
+    
+    // 检查服务当前是否正在运行（通过按钮状态判断）
+    bool was_running = lv_obj_has_state(ui_ButtonTTLStart, LV_STATE_DISABLED);
+    
+    if (was_running) {
+        // 如果正在运行，需要先停止，重配置，然后重启
+        ESP_LOGI(TAG, "Service is running, performing hot reconfiguration...");
+        
+        // 暂停定时器和接收
+        lv_timer_pause(app->_update_timer);
+        app->_uart_service.stopReceiving();
+        
+        // 等待停止完成
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        // 重新配置UART服务
+        app->_uart_service.reconfigure(app->_current_config);
+        
+        // 等待配置完成
+        vTaskDelay(pdMS_TO_TICKS(50));
+        
+        // 重启服务
+        app->_uart_service.startReceiving();
+        lv_timer_resume(app->_update_timer);
+        
+        // 显示重配置消息
+        const char* reconfig_msg = "\r\n[System] Configuration updated and service restarted.\r\n";
+        app->addTextToDisplay(reconfig_msg);
+        
+        ESP_LOGI(TAG, "Hot reconfiguration completed successfully");
+    } else {
+        // 如果没有运行，只需重配置即可
+        ESP_LOGI(TAG, "Service is stopped, performing cold reconfiguration...");
+        app->_uart_service.reconfigure(app->_current_config);
+        ESP_LOGI(TAG, "Cold reconfiguration completed");
+    }
     
     ESP_LOGI(TAG, "UART configuration applied and saved");
     

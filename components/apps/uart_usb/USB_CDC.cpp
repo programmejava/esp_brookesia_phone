@@ -445,7 +445,16 @@ void USB_CDC::onButtonApplyClicked(lv_event_t *e)
             .stop_bits = new_settings.stop_bits
         };
         
-        app->_usb_cdc_service.configureSerialPort(config);
+        // [修复问题2] 强制应用USB CDC配置
+        ESP_LOGI(TAG, "Forcefully applying configuration: %lu baud", new_settings.baud_rate);
+        
+        // 多次尝试配置以确保生效
+        for (int attempt = 0; attempt < 3; attempt++) {
+            app->_usb_cdc_service.configureSerialPort(config);
+            vTaskDelay(pdMS_TO_TICKS(50));  // 等待配置生效
+            
+            ESP_LOGI(TAG, "Configuration attempt %d/3 completed", attempt + 1);
+        }
         
         // 4. 恢复定时器
         if (app->_update_timer) {
