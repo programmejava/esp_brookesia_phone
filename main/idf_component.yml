@@ -1,0 +1,15 @@
+## IDF Component Manager Manifest File
+dependencies:
+  espressif/esp_wifi_remote:
+    version: '*'
+  espressif/esp_hosted:
+    version: '*'
+
+  espressif/esp-brookesia:
+    version: 0.4.*
+
+  espressif/esp_video:
+    version: '*'
+  espressif/avi_player: ^2.0.0
+  espressif/usb_host_cdc_acm: ^2.1.0
+  espressif/esp_tinyusb: ^2.0.0

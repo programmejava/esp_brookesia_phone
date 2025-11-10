@@ -1,0 +1,9 @@
+SET(SOURCES screens/ui_PowerController.c
+    ui.c
+    components/ui_comp_hook.c
+    ui_helpers.c
+    fonts/ui_font_JetBrainsMono24.c
+    fonts/ui_font_JetBrainsMono36.c
+    fonts/ui_font_JetBrainsMono48.c)
+
+add_library(ui ${SOURCES})

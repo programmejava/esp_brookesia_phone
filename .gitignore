@@ -1,0 +1,62 @@
+# ESP-IDF 构建文件
+/build/
+/managed_components/
+/dependencies.lock
+
+# 编译器和调试器文件
+*.o
+*.a
+*.so
+*.elf
+*.bin
+*.map
+
+# IDE 文件
+.vscode/
+*.code-workspace
+.idea/
+*.iml
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+*~
+
+# 日志文件
+*.log
+*_log.txt
+
+# ESP-IDF 特定文件
+sdkconfig.old*
+.config.old
+.flash_args
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# 备份文件
+*.bak
+*.backup
+*.orig
+
+# 临时文件
+*.swp
+*.swo
+
+# CMake 缓存
+CMakeCache.txt
+CMakeFiles/
+
+# 证书和密钥文件 (如果有的话)
+*.pem
+*.key
+*.crt
+*.p12
+
+# 用户特定配置 (可选)
+# sdkconfig.local
