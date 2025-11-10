@@ -7,7 +7,9 @@
 
 // 常量定义
 #define MAX_UI_UPDATE_LEN 1024          // UI单次更新最大长度
-#define TEXT_AREA_MAX_LEN 4096          // 文本区域最大长度
+#define TEXT_AREA_MAX_LEN 12288         // 文本区域最大长度（12KB）- 与USB CDC保持一致
+#define TEXT_AREA_CLEAR_TRIGGER 10240   // 触发清空的长度（10KB）
+#define TEXT_AREA_KEEP_LEN 4096         // 清空后保留的长度（4KB）
 #define HEARTBEAT_INTERVAL_MS 2000      // 心跳包发送间隔（毫秒）
 
 static const char *TAG = "AppUARTTTL";
@@ -43,9 +45,25 @@ UARTTTL::UARTTTL() :
 
 UARTTTL::~UARTTTL()
 {
+    ESP_LOGI(TAG, "UART TTL destructor called.");
+    
+    // [修复蓝屏问题] 确保析构函数中的资源清理
+    if (_update_timer) {
+        ESP_LOGW(TAG, "Destructor: cleaning up timer that wasn't properly closed");
+        lv_timer_pause(_update_timer);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        lv_timer_del(_update_timer);
+        _update_timer = nullptr;
+    }
+    
+    // 确保UART服务完全停止
+    _uart_service.stopReceiving();
+    
     if (_nvs_handle != 0) {
         nvs_close(_nvs_handle);
     }
+    
+    ESP_LOGI(TAG, "UART TTL destructor completed.");
 }
 
 bool UARTTTL::init(void)
@@ -157,17 +175,39 @@ bool UARTTTL::close(void)
 {
     ESP_LOGI(TAG, "Closing application, stopping UART service");
     
-    // 清理定时器
+    // [修复蓝屏问题] 1. 首先暂停定时器，防止在清理过程中继续执行
     if (_update_timer) {
+        ESP_LOGI(TAG, "Pausing update timer before cleanup...");
+        lv_timer_pause(_update_timer);
+        vTaskDelay(pdMS_TO_TICKS(100));  // 等待当前定时器回调完成
+    }
+    
+    // 2. 停止UART服务
+    ESP_LOGI(TAG, "Stopping UART service...");
+    _uart_service.stopReceiving();
+    
+    // 3. 等待UART服务完全停止
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // 4. 安全删除定时器
+    if (_update_timer) {
+        ESP_LOGI(TAG, "Safely deleting update timer...");
         lv_timer_del(_update_timer);
         _update_timer = nullptr;
     }
     
-    // 停止UART接收
-    _uart_service.stopReceiving();
+    // 5. 重置状态变量
+    _current_text_len = 0;
     
-    // 清空UI引用
+    // 6. 清理TextArea内容，防止内存泄漏
+    if (_text_area_ttl && lv_obj_is_valid(_text_area_ttl)) {
+        lv_textarea_set_text(_text_area_ttl, "");
+    }
+    
+    // 7. 清空UI引用
     _text_area_ttl = nullptr;
+    
+    ESP_LOGI(TAG, "UART TTL app cleanup completed successfully");
     
     return true;
 }
@@ -224,9 +264,24 @@ void UARTTTL::setupSettingsScreenEvents()
 
 void UARTTTL::uiUpdateTimerCb(lv_timer_t *timer)
 {
+    // [修复显示问题] 加强定时器回调的安全检查
+    if (!timer || !timer->user_data) {
+        ESP_LOGW(TAG, "Timer callback: invalid timer or user_data");
+        return;
+    }
+    
     UARTTTL* app = static_cast<UARTTTL*>(timer->user_data);
-    if (!app || !app->_text_area_ttl) { 
+    
+    // 检查应用对象和UI对象是否有效
+    if (!app || !app->_text_area_ttl || !lv_obj_is_valid(app->_text_area_ttl)) { 
+        ESP_LOGW(TAG, "Timer callback: invalid app or TextArea object");
         return; 
+    }
+    
+    // 检查定时器是否已被标记为删除
+    if (app->_update_timer != timer) {
+        ESP_LOGW(TAG, "Timer callback: timer mismatch, skipping update");
+        return;
     }
 
     // 处理接收到的UART数据
@@ -247,17 +302,8 @@ void UARTTTL::uiUpdateTimerCb(lv_timer_t *timer)
         }
         
         if (total_read_len > 0) {
-            // 检查文本区域长度是否超限，超限则清空
-            if (app->_current_text_len + total_read_len > TEXT_AREA_MAX_LEN) {
-                const char* clear_msg = "[System] Log cleared due to size limit.\r\n";
-                lv_textarea_set_text(app->_text_area_ttl, clear_msg);
-                app->_current_text_len = strlen(clear_msg);
-            }
-            
-            // 添加接收到的数据到文本区域
-            local_buf[total_read_len] = '\0';
-            lv_textarea_add_text(app->_text_area_ttl, local_buf);
-            app->_current_text_len += total_read_len;
+            // 使用改进的文本处理方法
+            app->addTextToDisplayImproved(local_buf, total_read_len);
         }
     }
     
@@ -306,8 +352,7 @@ void UARTTTL::onButtonStartClicked(lv_event_t* e)
 
     // 添加系统消息
     const char* msg = "\r\n[System] Service started.\r\n";
-    lv_textarea_add_text(app->_text_area_ttl, msg);
-    app->_current_text_len += strlen(msg);
+    app->addTextToDisplay(msg);
 
     // 更新按钮状态
     lv_obj_add_state(ui_ButtonTTLStart, LV_STATE_DISABLED);
@@ -328,8 +373,7 @@ void UARTTTL::onButtonStopClicked(lv_event_t *e)
 
     // 添加系统消息
     const char* msg = "\r\n[System] Service stopped.\r\n";
-    lv_textarea_add_text(app->_text_area_ttl, msg);
-    app->_current_text_len += strlen(msg);
+    app->addTextToDisplay(msg);
 
     // 更新按钮状态
     lv_obj_clear_state(ui_ButtonTTLStart, LV_STATE_DISABLED);
@@ -370,8 +414,7 @@ void UARTTTL::onSwitchHeartbeatToggled(lv_event_t *e)
     const char* status_msg = app->_heartbeat_enabled ? 
         "\r\n[System] Heartbeat enabled.\r\n" : 
         "\r\n[System] Heartbeat disabled.\r\n";
-    lv_textarea_add_text(app->_text_area_ttl, status_msg);
-    app->_current_text_len += strlen(status_msg);
+    app->addTextToDisplay(status_msg);
 }
 
 void UARTTTL::onScreenSettingsLoaded(lv_event_t *e)
@@ -445,4 +488,171 @@ void UARTTTL::onButtonSettingsBackClicked(lv_event_t *e)
 {
     ESP_LOGD(TAG, "Settings back button clicked, returning to main screen");
     lv_scr_load(ui_ScreenTTL);
+}
+
+// [新增] 智能文本管理 - 添加文本到显示区域
+void UARTTTL::addTextToDisplay(const char* text)
+{
+    if (!text || !_text_area_ttl) {
+        return;
+    }
+    
+    size_t text_len = strlen(text);
+    
+    // 检查是否需要智能清理文本区域
+    if (_current_text_len + text_len > TEXT_AREA_CLEAR_TRIGGER) {
+        smartTextAreaClear();
+    }
+    
+    // 添加新文本
+    lv_textarea_add_text(_text_area_ttl, text);
+    _current_text_len += text_len;
+    
+    // 自动滚动到底部
+    lv_obj_scroll_to_y(_text_area_ttl, LV_COORD_MAX, LV_ANIM_OFF);
+    
+    ESP_LOGD(TAG, "Added %zu chars, total: %zu chars", text_len, _current_text_len);
+}
+
+// [新增] 改进的文本处理函数 - 处理数据截断和字符过滤问题
+void UARTTTL::addTextToDisplayImproved(const char* text, size_t actual_len)
+{
+    // [修复显示问题] 增强安全检查
+    if (!text || actual_len == 0) {
+        return;
+    }
+    
+    // 检查UI对象是否有效
+    if (!_text_area_ttl || !lv_obj_is_valid(_text_area_ttl)) {
+        ESP_LOGW(TAG, "TextArea UI object is invalid, skipping text addition");
+        return;
+    }
+    
+    // 限制最大处理长度，防止内存问题
+    if (actual_len > MAX_UI_UPDATE_LEN) {
+        ESP_LOGW(TAG, "Text too long (%zu), truncating to %d", actual_len, MAX_UI_UPDATE_LEN);
+        actual_len = MAX_UI_UPDATE_LEN;
+    }
+    
+    // 创建处理后的文本缓冲区，加强内存安全
+    char* processed_text = (char*)malloc(actual_len + 128);  // 更多额外空间
+    if (!processed_text) {
+        ESP_LOGE(TAG, "Failed to allocate memory for text processing (%zu bytes)", actual_len + 128);
+        return;
+    }
+    
+    // 初始化缓冲区
+    memset(processed_text, 0, actual_len + 128);
+    
+    size_t processed_len = 0;
+    
+    // 逐字节处理，确保文本显示正确
+    for (size_t i = 0; i < actual_len; i++) {
+        char c = text[i];
+        
+        // 处理不可打印字符
+        if (c == '\0') {
+            break;  // 遇到null terminator停止
+        } else if (c == '\r') {
+            // Windows风格的回车符，转换为换行符
+            processed_text[processed_len++] = '\n';
+        } else if (c == '\n') {
+            // Unix风格的换行符，直接保留
+            processed_text[processed_len++] = '\n';
+        } else if (c >= 32 && c <= 126) {
+            // 可打印ASCII字符
+            processed_text[processed_len++] = c;
+        } else {
+            // 过滤掉所有其他字符（包括UTF-8），避免乱码
+            // 如果是控制字符或高位字符，跳过不添加
+            continue;
+        }
+    }
+    
+    // 确保以换行符结束（如果原文本没有的话）
+    if (processed_len > 0 && processed_text[processed_len - 1] != '\n') {
+        processed_text[processed_len++] = '\n';
+    }
+    
+    processed_text[processed_len] = '\0';
+    
+    // 检查是否需要智能清理文本区域
+    if (_current_text_len + processed_len > TEXT_AREA_CLEAR_TRIGGER) {
+        smartTextAreaClear();
+    }
+    
+    // 添加处理后的文本
+    lv_textarea_add_text(_text_area_ttl, processed_text);
+    _current_text_len += processed_len;
+    
+    // 自动滚动到底部
+    lv_obj_scroll_to_y(_text_area_ttl, LV_COORD_MAX, LV_ANIM_OFF);
+    
+    ESP_LOGD(TAG, "Added %zu chars (processed from %zu), total: %zu chars", 
+             processed_len, actual_len, _current_text_len);
+    
+    free(processed_text);
+}
+
+// [新增] 智能清理文本区域 - 保留最新内容
+void UARTTTL::smartTextAreaClear(void)
+{
+    if (!_text_area_ttl) {
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Text area approaching limit (%zu chars), performing smart cleanup...", _current_text_len);
+    
+    // 获取当前文本内容
+    const char* current_text = lv_textarea_get_text(_text_area_ttl);
+    if (!current_text) {
+        _current_text_len = 0;
+        return;
+    }
+    
+    size_t current_len = strlen(current_text);
+    
+    if (current_len <= TEXT_AREA_KEEP_LEN) {
+        // 如果当前文本已经很短，直接返回
+        _current_text_len = current_len;
+        return;
+    }
+    
+    // 计算要保留的起始位置（保留最后的TEXT_AREA_KEEP_LEN字符）
+    size_t keep_start = current_len - TEXT_AREA_KEEP_LEN;
+    
+    // 尝试从完整行开始保留（寻找换行符）
+    const char* line_start = current_text + keep_start;
+    const char* next_newline = strchr(line_start, '\n');
+    if (next_newline && (next_newline - current_text) < current_len - 100) {
+        // 找到换行符且不是太靠近末尾，从下一行开始
+        keep_start = (next_newline + 1) - current_text;
+    }
+    
+    // 添加清理提示信息
+    const char* cleanup_msg = "[System] Text buffer optimized - showing recent messages...\n";
+    
+    // 创建新的文本内容
+    char* new_content = (char*)malloc(strlen(cleanup_msg) + (current_len - keep_start) + 1);
+    if (new_content) {
+        strcpy(new_content, cleanup_msg);
+        strcat(new_content, current_text + keep_start);
+        
+        // 设置新内容
+        lv_textarea_set_text(_text_area_ttl, new_content);
+        _current_text_len = strlen(new_content);
+        
+        // 自动滚动到底部
+        lv_obj_scroll_to_y(_text_area_ttl, LV_COORD_MAX, LV_ANIM_OFF);
+        
+        ESP_LOGI(TAG, "Text cleanup completed: %zu -> %zu chars (saved %zu chars)", 
+                 current_len, _current_text_len, current_len - _current_text_len);
+        
+        free(new_content);
+    } else {
+        // 内存不足时的简单清理
+        ESP_LOGW(TAG, "Memory insufficient for smart cleanup, using simple clear");
+        lv_textarea_set_text(_text_area_ttl, cleanup_msg);
+        _current_text_len = strlen(cleanup_msg);
+    }
 }

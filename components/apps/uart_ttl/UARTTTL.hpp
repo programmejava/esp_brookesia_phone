@@ -46,6 +46,11 @@ private:
     // NVS存储操作方法
     void loadSettings();
     void saveSettings();
+    
+    // [新增] 文本处理方法
+    void addTextToDisplay(const char* text);
+    void addTextToDisplayImproved(const char* text, size_t actual_len);
+    void smartTextAreaClear(void);
 
     // 成员变量
     UartService _uart_service;          // UART服务对象
