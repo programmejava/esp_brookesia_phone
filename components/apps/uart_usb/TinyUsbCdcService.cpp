@@ -76,24 +76,59 @@ bool TinyUsbCdcService::begin() {
 }
 
 void TinyUsbCdcService::end() {
-    stopScan();
+    ESP_LOGI(TAG, "Starting USB Host Service cleanup...");
+    
+    // [修复蓝屏问题] 改善服务关闭顺序，防止竞争条件
+    
+    // 1. 首先停止所有任务
+    ESP_LOGI(TAG, "Stopping heartbeat task...");
     stopHeartbeat();
+    
+    ESP_LOGI(TAG, "Stopping scan task...");
+    stopScan();
+    
+    // 2. 等待任务完全停止
+    vTaskDelay(pdMS_TO_TICKS(300));
+    
+    // 3. 关闭设备连接
     if (_s_cdc_device_handle) {
+        ESP_LOGI(TAG, "Closing CDC device handle...");
         cdc_acm_host_close(_s_cdc_device_handle);
         _s_cdc_device_handle = nullptr;
     }
-    cdc_acm_host_uninstall();
+    
+    // 4. 清理设备状态
+    _s_is_device_connected = false;
+    
+    // 5. 卸载CDC驱动
+    ESP_LOGI(TAG, "Uninstalling CDC ACM driver...");
+    esp_err_t ret = cdc_acm_host_uninstall();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "CDC ACM uninstall warning: %s", esp_err_to_name(ret));
+    }
+    
+    // 6. 停止主机库任务
     if (_host_task_handle) {
+        ESP_LOGI(TAG, "Deleting host library task...");
         vTaskDelete(_host_task_handle);
         _host_task_handle = nullptr;
     }
-    usb_host_uninstall();
+    
+    // 7. 卸载USB主机
+    ESP_LOGI(TAG, "Uninstalling USB Host...");
+    ret = usb_host_uninstall();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "USB Host uninstall warning: %s", esp_err_to_name(ret));
+    }
+    
+    // 8. 最后清理ring buffer
     if (_s_rx_ring_buffer) {
+        ESP_LOGI(TAG, "Deleting ring buffer...");
         vRingbufferDelete(_s_rx_ring_buffer);
         _s_rx_ring_buffer = nullptr;
     }
-    _s_is_device_connected = false;
-    ESP_LOGI(TAG, "USB Host Service deinitialized");
+    
+    ESP_LOGI(TAG, "USB Host Service deinitialized successfully");
 }
 
 void TinyUsbCdcService::startScan() {

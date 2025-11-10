@@ -42,6 +42,22 @@ USB_CDC::USB_CDC() :
 USB_CDC::~USB_CDC()
 {
     ESP_LOGI(TAG, "USB_CDC destructor called.");
+    
+    // [修复蓝屏问题] 确保析构函数中的资源清理
+    if (_update_timer) {
+        ESP_LOGW(TAG, "Destructor: cleaning up timer that wasn't properly closed");
+        lv_timer_pause(_update_timer);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        lv_timer_del(_update_timer);
+        _update_timer = nullptr;
+    }
+    
+    // 确保USB服务完全停止
+    _usb_cdc_service.stopHeartbeat();
+    _usb_cdc_service.stopScan();
+    _usb_cdc_service.forceDisconnectDevice();
+    
+    ESP_LOGI(TAG, "USB_CDC destructor completed.");
 }
 
 bool USB_CDC::init(void)
@@ -109,21 +125,41 @@ bool USB_CDC::close(void)
 {
     ESP_LOGI(TAG, "Closing App UI, cleaning up resources.");
     
-    // 停止定时器
+    // [修复蓝屏问题] 1. 首先暂停定时器，防止在清理过程中继续执行
     if (_update_timer) {
+        ESP_LOGI(TAG, "Pausing update timer before cleanup...");
+        lv_timer_pause(_update_timer);
+        vTaskDelay(pdMS_TO_TICKS(100));  // 等待当前定时器回调完成
+    }
+    
+    // 2. 停止USB服务（按正确顺序）
+    ESP_LOGI(TAG, "Stopping USB services...");
+    _usb_cdc_service.stopHeartbeat();      // 先停止心跳
+    _usb_cdc_service.stopScan();           // 再停止扫描
+    
+    // 3. 等待USB服务完全停止
+    vTaskDelay(pdMS_TO_TICKS(200));
+    
+    // 4. 强制断开设备连接
+    _usb_cdc_service.forceDisconnectDevice();
+    
+    // 5. 最后安全删除定时器
+    if (_update_timer) {
+        ESP_LOGI(TAG, "Safely deleting update timer...");
         lv_timer_del(_update_timer);
         _update_timer = nullptr;
     }
     
-    // 完全停止USB服务
-    _usb_cdc_service.stopScan();
-    _usb_cdc_service.stopHeartbeat();
-    _usb_cdc_service.forceDisconnectDevice();  // 确保设备连接被断开
-    
-    // 重置连接状态
+    // 6. 重置所有状态变量
     _last_conn_state = false;
+    _current_text_len = 0;
     
-    ESP_LOGI(TAG, "USB CDC app cleanup completed");
+    // 7. 清理TextArea内容，防止内存泄漏
+    if (uic_TextAreaUSB && lv_obj_is_valid(uic_TextAreaUSB)) {
+        lv_textarea_set_text(uic_TextAreaUSB, "");
+    }
+    
+    ESP_LOGI(TAG, "USB CDC app cleanup completed successfully");
     
     return true;
 }
@@ -157,10 +193,29 @@ void USB_CDC::extraUiInit(void)
 
 void USB_CDC::uiUpdateTimerCb(lv_timer_t *timer)
 {
+    // [修复蓝屏问题] 加强定时器回调的安全检查
+    if (!timer || !timer->user_data) {
+        ESP_LOGW(TAG, "Timer callback: invalid timer or user_data");
+        return;
+    }
+    
     USB_CDC* app = static_cast<USB_CDC*>(timer->user_data);
     
-    // 简单的安全检查
-    if (!app || !uic_TextAreaUSB) {
+    // 检查应用对象是否有效
+    if (!app) {
+        ESP_LOGW(TAG, "Timer callback: invalid app object");
+        return;
+    }
+    
+    // 检查UI对象是否仍然有效
+    if (!uic_TextAreaUSB || !lv_obj_is_valid(uic_TextAreaUSB)) {
+        ESP_LOGW(TAG, "Timer callback: TextArea UI object is invalid");
+        return;
+    }
+    
+    // 检查定时器是否已被标记为删除
+    if (app->_update_timer != timer) {
+        ESP_LOGW(TAG, "Timer callback: timer mismatch, skipping update");
         return;
     }
     
@@ -474,16 +529,32 @@ void USB_CDC::addTextToDisplay(const char* text)
 // [新增] 改进的文本处理函数 - 处理数据截断和换行符问题
 void USB_CDC::addTextToDisplayImproved(const char* text, size_t actual_len)
 {
-    if (!text || !uic_TextAreaUSB || actual_len == 0) {
+    // [修复蓝屏问题] 增强安全检查
+    if (!text || actual_len == 0) {
         return;
     }
     
-    // 创建处理后的文本缓冲区
-    char* processed_text = (char*)malloc(actual_len + 64);  // 额外空间处理换行符
-    if (!processed_text) {
-        ESP_LOGW(TAG, "Failed to allocate memory for text processing");
+    // 检查UI对象是否有效
+    if (!uic_TextAreaUSB || !lv_obj_is_valid(uic_TextAreaUSB)) {
+        ESP_LOGW(TAG, "TextArea UI object is invalid, skipping text addition");
         return;
     }
+    
+    // 限制最大处理长度，防止内存问题
+    if (actual_len > MAX_UI_UPDATE_LEN) {
+        ESP_LOGW(TAG, "Text too long (%zu), truncating to %d", actual_len, MAX_UI_UPDATE_LEN);
+        actual_len = MAX_UI_UPDATE_LEN;
+    }
+    
+    // 创建处理后的文本缓冲区，加强内存安全
+    char* processed_text = (char*)malloc(actual_len + 128);  // 更多额外空间
+    if (!processed_text) {
+        ESP_LOGE(TAG, "Failed to allocate memory for text processing (%zu bytes)", actual_len + 128);
+        return;
+    }
+    
+    // 初始化缓冲区
+    memset(processed_text, 0, actual_len + 128);
     
     size_t processed_len = 0;
     
