@@ -15,6 +15,7 @@
 #include "esp_brookesia.hpp"
 #include "app_examples/phone/squareline/src/phone_app_squareline.hpp"
 #include "apps.h"
+#include "global_screen_saver.hpp"
 
 static const char *TAG = "main";
 
@@ -78,6 +79,10 @@ extern "C" void app_main(void)
     AppSettings *app_settings = new AppSettings();
     assert(app_settings != nullptr && "Failed to create app_settings");
     assert((phone->installApp(app_settings) >= 0) && "Failed to begin app_settings");
+    
+    // Initialize global screen saver
+    GlobalScreenSaver& screenSaver = GlobalScreenSaver::getInstance();
+    screenSaver.init();
 
     Game2048 *game_2048 = new Game2048();
     assert(game_2048 != nullptr && "Failed to create game_2048");
@@ -143,6 +148,7 @@ extern "C" void app_main(void)
                          "free psram size: %d KB, total psram size: %d KB",
                          free_sram_size_kb, total_sram_size_kb, free_psram_size_kb, total_psram_size_kb);
 
+    // Global touch monitoring is now handled by GlobalScreenSaver
     
 // #endif
     ESP_LOGI(TAG,"setup done");

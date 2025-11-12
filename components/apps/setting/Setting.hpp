@@ -25,6 +25,18 @@ public:
     bool init(void) override;
     bool pause(void) override;
     bool resume(void) override;
+    
+    // Screen Saver - public functions
+    void initScreenSaverTimer(void);
+    void startScreenSaverTimer(void);
+    void stopScreenSaverTimer(void);
+    void resetScreenSaverTimer(void);
+    void onUserActivity(void);
+    void turnOffScreen(void);
+    void turnOnScreen(void);
+    static AppSettings* _screen_saver_instance;
+    static void screenSaverTimerCallback(void* arg);
+    static void globalActivityEventCallback(lv_event_t * e);
 
 private:
     typedef enum {
@@ -34,6 +46,7 @@ private:
         UI_BLUETOOTH_SETTING_INDEX,
         UI_VOLUME_SETTING_INDEX,
         UI_BRIGHTNESS_SETTING_INDEX,
+        UI_SCREENSAVER_SETTING_INDEX,
         UI_ABOUT_SETTING_INDEX,
         UI_MAX_INDEX,
     } SettingScreenIndex_t;
@@ -75,6 +88,7 @@ private:
     static void euiRefresTask(void *arg);
     static void wifiScanTask(void *arg);
     static void wifiConnectTask(void *arg);
+    static void screenSaverTask(void *arg);
 
     /* Event Handler */
     // WiFi
@@ -89,6 +103,8 @@ private:
     static void onKeyboardScreenSettingVerificationClickedEventCallback(lv_event_t *e);
     // Bluetooth
     static void onSwitchPanelScreenSettingBLESwitchValueChangeEventCallback( lv_event_t * e);
+    // Screen Saver
+    static void onScreenTimeoutDropdownValueChangeEventCallback( lv_event_t * e);
     // Audio
     static void onSliderPanelVolumeSwitchValueChangeEventCallback( lv_event_t * e);
     // Brightness
@@ -101,7 +117,14 @@ private:
     lv_obj_t *_panel_wifi_connect;
     lv_obj_t *_spinner_wifi_connect;
     lv_obj_t *_img_wifi_connect;
+    lv_obj_t *_screen_timeout_dropdown;
     std::array<lv_obj_t *, UI_MAX_INDEX> _screen_list;
+    
+    // Screen saver variables
+    bool _screen_is_off;
+    int32_t _saved_brightness;
+    esp_timer_handle_t _screen_saver_timer;
+    bool _screen_saver_timer_started;
     std::map<std::string, int32_t> _nvs_param_map;
     const ESP_Brookesia_StatusBar *status_bar; 
     const ESP_Brookesia_RecentsScreen *backstage;

@@ -13,6 +13,7 @@
 #include "esp_check.h"
 #include "esp_memory_utils.h"
 #include "esp_mac.h"
+#include "esp_timer.h"
 #include "bsp/esp-bsp.h"
 #include "bsp_board_extra.h"
 #include "nvs.h"
@@ -20,6 +21,7 @@
 #include "ui/ui.h"
 #include "Setting.hpp"
 #include "app_sntp.h"
+#include "../../../main/global_screen_saver.hpp"
 
 #include "esp_brookesia_versions.h"
 
@@ -46,11 +48,22 @@
 #define SPEAKER_VOLUME_MIN              (0)
 #define SPEAKER_VOLUME_MAX              (100)
 
+#define SCREEN_TIMEOUT_NEVER            (0)     // 从不熄屏
+#define SCREEN_TIMEOUT_30S              (30)    // 30秒
+#define SCREEN_TIMEOUT_1MIN             (60)    // 1分钟  
+#define SCREEN_TIMEOUT_2MIN             (120)   // 2分钟
+#define SCREEN_TIMEOUT_5MIN             (300)   // 5分钟
+#define SCREEN_TIMEOUT_DEFAULT          SCREEN_TIMEOUT_1MIN
+
+// Static instance for global screen saver access
+AppSettings* AppSettings::_screen_saver_instance = nullptr;
+
 #define NVS_STORAGE_NAMESPACE           "storage"
 #define NVS_KEY_WIFI_ENABLE             "wifi_en"
 #define NVS_KEY_BLE_ENABLE              "ble_en"
 #define NVS_KEY_AUDIO_VOLUME            "volume"
 #define NVS_KEY_DISPLAY_BRIGHTNESS      "brightness"
+#define NVS_KEY_SCREEN_TIMEOUT          "scr_timeout"
 
 #define UI_MAIN_ITEM_LEFT_OFFSET        (20)
 #define UI_WIFI_LIST_UP_OFFSET          (20)
@@ -66,9 +79,15 @@
 
 using namespace std;
 
+// Forward declaration for touch activity function
+bool checkTouchActivity(void);
+
+
+
 #define SCAN_LIST_SIZE      25
 
 static const char TAG[] = "EUI_Setting";
+static const char SAVER_TAG[] = "ScreenSaver";
 
 TaskHandle_t wifi_scan_handle_task;
 
@@ -115,12 +134,22 @@ AppSettings::AppSettings():
     _is_ui_resumed(false),
     _is_ui_del(true),
     _screen_index(UI_MAIN_SETTING_INDEX),
-    _screen_list({nullptr})
+    _screen_list({nullptr}),
+    _screen_is_off(false),
+    _saved_brightness(0),
+    _screen_saver_timer(nullptr),
+    _screen_saver_timer_started(false)
 {
 }
 
 AppSettings::~AppSettings()
 {
+    // Clean up screen saver timer
+    if (_screen_saver_timer != nullptr) {
+        esp_timer_stop(_screen_saver_timer);
+        esp_timer_delete(_screen_saver_timer);
+        _screen_saver_timer = nullptr;
+    }
 }
 
 bool AppSettings::run(void)
@@ -176,6 +205,8 @@ bool AppSettings::close(void)
         stopWifiScan();
     } 
     
+    // Note: Global screen saver continues running independently of Settings app
+    
     _is_ui_del = true;
     
     return true;
@@ -196,14 +227,23 @@ bool AppSettings::init(void)
     // _nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS] = bsp_display_brightness_get();
     _nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS] = brightness;
     _nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS] = max(min((int)_nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS], SCREEN_BRIGHTNESS_MAX), SCREEN_BRIGHTNESS_MIN);
+    _nvs_param_map[NVS_KEY_SCREEN_TIMEOUT] = SCREEN_TIMEOUT_DEFAULT;
     // Load NVS parameters if exist
     loadNvsParam();
     // Update System parameters
     bsp_extra_codec_volume_set(_nvs_param_map[NVS_KEY_AUDIO_VOLUME], (int *)&_nvs_param_map[NVS_KEY_AUDIO_VOLUME]);
     bsp_display_brightness_set(_nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS]);
 
+    // Initialize screen saver variables (for UI state tracking only)
+    _screen_is_off = false;
+    _saved_brightness = _nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS];
+
     xTaskCreate(euiRefresTask, "Home Refresh", HOME_REFRESH_TASK_STACK_SIZE, this, HOME_REFRESH_TASK_PRIORITY, NULL);
     xTaskCreate(wifiScanTask, "WiFi Scan", WIFI_SCAN_TASK_STACK_SIZE, this, WIFI_SCAN_TASK_PRIORITY, NULL);
+    
+    // Set initial timeout for global screen saver
+    GlobalScreenSaver& screenSaver = GlobalScreenSaver::getInstance();
+    screenSaver.setTimeoutSeconds(_nvs_param_map[NVS_KEY_SCREEN_TIMEOUT]);
 
     return true;
 }
@@ -225,6 +265,7 @@ bool AppSettings::resume(void)
 void AppSettings::extraUiInit(void)
 {
     /* Main */
+    lv_label_set_text(ui_LabelPanelSettingMainContainer2Blue, "Screen Saver");
     lv_label_set_text(ui_LabelPanelSettingMainContainer3Volume, "Audio");
     lv_label_set_text(ui_LabelPanelSettingMainContainer4Light, "Display");
     lv_obj_align_to(ui_LabelPanelSettingMainContainer1WiFi, ui_ImagePanelSettingMainContainer1WiFi, LV_ALIGN_OUT_RIGHT_MID,
@@ -240,6 +281,11 @@ void AppSettings::extraUiInit(void)
     // Record the screen index and install the screen loaded event callback
     _screen_list[UI_MAIN_SETTING_INDEX] = ui_ScreenSettingMain;
     lv_obj_add_event_cb(ui_ScreenSettingMain, onScreenLoadEventCallback, LV_EVENT_SCREEN_LOADED, this);
+    
+    // Set up global screen saver instance  
+    _screen_saver_instance = this;
+    
+    ESP_LOGI(SAVER_TAG, "Screen saver initialized with %d second timeout", _nvs_param_map[NVS_KEY_SCREEN_TIMEOUT]);
 
     /* WiFi */
     // Switch
@@ -315,11 +361,23 @@ void AppSettings::extraUiInit(void)
     _screen_list[UI_WIFI_CONNECT_INDEX] = ui_ScreenSettingVerification;
     lv_obj_add_event_cb(ui_ScreenSettingVerification, onScreenLoadEventCallback, LV_EVENT_SCREEN_LOADED, this);
 
-    /* Bluetooth */
-    lv_obj_add_event_cb(ui_SwitchPanelScreenSettingBLESwitch, onSwitchPanelScreenSettingBLESwitchValueChangeEventCallback,
+    /* Screen Saver (reusing BLE UI) */
+    // Change BLE switch to dropdown for screen timeout
+    lv_obj_add_flag(ui_SwitchPanelScreenSettingBLESwitch, LV_OBJ_FLAG_HIDDEN);
+    
+    // Create a dropdown for screen timeout selection
+    _screen_timeout_dropdown = lv_dropdown_create(ui_PanelScreenSettingBLESwitch);
+    lv_dropdown_set_options(_screen_timeout_dropdown, "Never\n30 Seconds\n1 Minute\n2 Minutes\n5 Minutes");
+    lv_obj_set_size(_screen_timeout_dropdown, 200, 40);
+    lv_obj_align(_screen_timeout_dropdown, LV_ALIGN_RIGHT_MID, -20, 0);
+    lv_obj_add_event_cb(_screen_timeout_dropdown, onScreenTimeoutDropdownValueChangeEventCallback,
                         LV_EVENT_VALUE_CHANGED, this);
+    
+    // Change label text
+    lv_label_set_text(ui_LabelPanelScreenSettingBLESwitch, "Screen Timeout");
+    
     // Record the screen index and install the screen loaded event callback
-    _screen_list[UI_BLUETOOTH_SETTING_INDEX] = ui_ScreenSettingBLE;
+    _screen_list[UI_SCREENSAVER_SETTING_INDEX] = ui_ScreenSettingBLE;
     lv_obj_add_event_cb(ui_ScreenSettingBLE, onScreenLoadEventCallback, LV_EVENT_SCREEN_LOADED, this);
 
     /* Display */
@@ -347,7 +405,8 @@ void AppSettings::extraUiInit(void)
     _screen_list[UI_ABOUT_SETTING_INDEX] = ui_ScreenSettingAbout;
     lv_obj_add_event_cb(ui_ScreenSettingAbout, onScreenLoadEventCallback, LV_EVENT_SCREEN_LOADED, this);
 
-    lv_obj_add_flag(ui_PanelSettingMainContainerItem2, LV_OBJ_FLAG_HIDDEN);
+    // Enable screen saver setting item
+    // lv_obj_add_flag(ui_PanelSettingMainContainerItem2, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(ui_LabelPanelPanelScreenSettingAbout3, mac_str);
     lv_label_set_text(ui_LabelPanelPanelScreenSettingAbout5, "v0.2.0");
     lv_label_set_text(ui_LabelPanelPanelScreenSettingAbout2, "ESP32-P4-Function-EV-Board");
@@ -468,6 +527,16 @@ void AppSettings::updateUiByNvsParam(void)
 
     lv_slider_set_value(ui_SliderPanelScreenSettingLightSwitch1, _nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS], LV_ANIM_OFF);
     lv_slider_set_value(ui_SliderPanelScreenSettingVolumeSwitch, _nvs_param_map[NVS_KEY_AUDIO_VOLUME], LV_ANIM_OFF);
+    
+    // Update screen timeout dropdown
+    int32_t timeout = _nvs_param_map[NVS_KEY_SCREEN_TIMEOUT];
+    uint16_t dropdown_index = 0;
+    if (timeout == SCREEN_TIMEOUT_NEVER) dropdown_index = 0;
+    else if (timeout == SCREEN_TIMEOUT_30S) dropdown_index = 1;
+    else if (timeout == SCREEN_TIMEOUT_1MIN) dropdown_index = 2;
+    else if (timeout == SCREEN_TIMEOUT_2MIN) dropdown_index = 3;
+    else if (timeout == SCREEN_TIMEOUT_5MIN) dropdown_index = 4;
+    lv_dropdown_set_selected(_screen_timeout_dropdown, dropdown_index);
 }
 
 esp_err_t AppSettings::initWifi()
@@ -987,3 +1056,172 @@ void AppSettings::onSliderPanelLightSwitchValueChangeEventCallback( lv_event_t *
 end:
     return;
 }
+
+void AppSettings::onScreenTimeoutDropdownValueChangeEventCallback( lv_event_t * e) {
+    AppSettings *app = (AppSettings *)lv_event_get_user_data(e);
+    if (app == NULL) {
+        ESP_LOGE(TAG, "Invalid app pointer");
+        return;
+    }
+    
+    uint16_t selected = lv_dropdown_get_selected(app->_screen_timeout_dropdown);
+    int32_t timeout_value = SCREEN_TIMEOUT_NEVER;
+    
+    switch (selected) {
+        case 0: timeout_value = SCREEN_TIMEOUT_NEVER; break;
+        case 1: timeout_value = SCREEN_TIMEOUT_30S; break;
+        case 2: timeout_value = SCREEN_TIMEOUT_1MIN; break;
+        case 3: timeout_value = SCREEN_TIMEOUT_2MIN; break;
+        case 4: timeout_value = SCREEN_TIMEOUT_5MIN; break;
+        default: timeout_value = SCREEN_TIMEOUT_DEFAULT; break;
+    }
+    
+    if (timeout_value != app->_nvs_param_map[NVS_KEY_SCREEN_TIMEOUT]) {
+        app->_nvs_param_map[NVS_KEY_SCREEN_TIMEOUT] = timeout_value;
+        app->setNvsParam(NVS_KEY_SCREEN_TIMEOUT, timeout_value);
+        
+        // Update global screen saver timeout
+        GlobalScreenSaver& screenSaver = GlobalScreenSaver::getInstance();
+        screenSaver.setTimeoutSeconds(timeout_value);
+        
+        ESP_LOGI(SAVER_TAG, "Screen timeout set to: %d seconds", timeout_value);
+    }
+}
+
+void AppSettings::initScreenSaverTimer(void) {
+    esp_timer_create_args_t timer_config = {
+        .callback = screenSaverTimerCallback,
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "screen_saver_timer",
+        .skip_unhandled_events = false
+    };
+    
+    esp_err_t ret = esp_timer_create(&timer_config, &_screen_saver_timer);
+    if (ret != ESP_OK) {
+        ESP_LOGE(SAVER_TAG, "Failed to create screen saver timer: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    // Set up global screen saver instance
+    _screen_saver_instance = this;
+    
+    // Note: Display-level event callbacks are not available in this LVGL version
+    // Touch monitoring will be handled by the main.cpp timer-based approach
+    
+    startScreenSaverTimer();
+    
+    ESP_LOGI(SAVER_TAG, "Screen saver initialized with global touch events and %d second timeout", _nvs_param_map[NVS_KEY_SCREEN_TIMEOUT]);
+}
+
+void AppSettings::startScreenSaverTimer(void) {
+    int32_t timeout_seconds = _nvs_param_map[NVS_KEY_SCREEN_TIMEOUT];
+    
+    // If timeout is NEVER (0), don't start timer
+    if (timeout_seconds <= 0) {
+        ESP_LOGI(SAVER_TAG, "Screen timeout disabled (NEVER)");
+        return;
+    }
+    
+    if (_screen_saver_timer != nullptr) {
+        // Always stop existing timer first to avoid conflicts
+        stopScreenSaverTimer();
+        
+        // Start timer with timeout in microseconds
+        uint64_t timeout_us = (uint64_t)timeout_seconds * 1000000ULL;
+        esp_err_t ret = esp_timer_start_once(_screen_saver_timer, timeout_us);
+        if (ret == ESP_OK) {
+            _screen_saver_timer_started = true;
+            ESP_LOGI(SAVER_TAG, "Screen saver timer started: %d seconds (%llu us)", timeout_seconds, timeout_us);
+        } else {
+            ESP_LOGE(SAVER_TAG, "Failed to start screen saver timer: %s", esp_err_to_name(ret));
+        }
+    }
+}
+
+void AppSettings::stopScreenSaverTimer(void) {
+    if (_screen_saver_timer != nullptr && _screen_saver_timer_started) {
+        esp_timer_stop(_screen_saver_timer);
+        _screen_saver_timer_started = false;
+        ESP_LOGD(SAVER_TAG, "Screen saver timer stopped");
+    }
+}
+
+void AppSettings::resetScreenSaverTimer(void) {
+    // Only reset if screen is currently on
+    if (!_screen_is_off) {
+        stopScreenSaverTimer();
+        startScreenSaverTimer();
+        ESP_LOGI(SAVER_TAG, "Screen saver timer reset - %d seconds countdown restarted", _nvs_param_map[NVS_KEY_SCREEN_TIMEOUT]);
+    }
+}
+
+void AppSettings::onUserActivity(void) {
+    static uint32_t last_activity_time = 0;
+    uint32_t current_time = esp_timer_get_time() / 1000; // Convert to ms
+    
+    // Debounce touch events (ignore events within 100ms of each other)
+    if (current_time - last_activity_time < 100) {
+        return;
+    }
+    last_activity_time = current_time;
+    
+    // Wake up screen if it was off
+    if (_screen_is_off) {
+        turnOnScreen();
+        ESP_LOGI(SAVER_TAG, "Screen woken up by touch activity");
+        
+        // When waking up from screen off, don't reset timer immediately
+        // Wait a bit to avoid immediately starting timeout again
+        return;
+    }
+    
+    // Reset timer for next timeout only if screen is on
+    resetScreenSaverTimer();
+}
+
+void AppSettings::screenSaverTimerCallback(void* arg) {
+    AppSettings* instance = static_cast<AppSettings*>(arg);
+    if (instance != nullptr) {
+        ESP_LOGI(SAVER_TAG, "Screen timeout reached - turning off screen");
+        instance->turnOffScreen();
+        instance->_screen_saver_timer_started = false;
+    }
+}
+
+void AppSettings::globalActivityEventCallback(lv_event_t * e) {
+    // 全局活动检测回调 - 处理所有触摸事件
+    if (_screen_saver_instance != nullptr) {
+        ESP_LOGD(SAVER_TAG, "Global touch activity detected");
+        _screen_saver_instance->onUserActivity();
+    }
+}
+
+void AppSettings::turnOffScreen(void) {
+    if (!_screen_is_off) {
+        _saved_brightness = _nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS];
+        bsp_display_brightness_set(0);
+        _screen_is_off = true;
+        ESP_LOGI(SAVER_TAG, "Screen turned off");
+    }
+}
+
+void AppSettings::turnOnScreen(void) {
+    if (_screen_is_off) {
+        bsp_display_brightness_set(_saved_brightness);
+        _screen_is_off = false;
+        ESP_LOGI(SAVER_TAG, "Screen turned on with brightness %d", _saved_brightness);
+        
+        // Start a delayed timer to begin screen saver countdown after screen wake up
+        // This prevents immediate timeout after wake up
+        lv_timer_create([](lv_timer_t * timer) {
+            if (_screen_saver_instance != nullptr && !_screen_saver_instance->_screen_is_off) {
+                _screen_saver_instance->startScreenSaverTimer();
+                ESP_LOGI(SAVER_TAG, "Screen saver timer started after wake-up delay");
+            }
+            lv_timer_del(timer);  // One-time timer
+        }, 1000, nullptr);  // 1 second delay before starting timer
+    }
+}
+
+
