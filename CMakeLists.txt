@@ -8,7 +8,7 @@ set(CMAKE_OBJECT_PATH_MAX 512)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 set(EXTRA_COMPONENT_DIRS
-    ../common_components
+    ${CMAKE_CURRENT_LIST_DIR}/common_components
     )
 
 set(CXX_COMPILE_OPTIONS
