@@ -9,11 +9,13 @@
 #include "bsp/esp-bsp.h"
 #include "bsp_board_extra.h"
 
+#include <sys/stat.h>
+
 #include "gui_music/lv_demo_music.h"
 #include "gui_music/lv_demo_music_main.h"
 #include "MusicPlayer.hpp"
 
-#define MUSIC_DIR   BSP_SD_MOUNT_POINT "/music"
+#define MUSIC_DIR   BSP_SD_MOUNT_POINT "/music_p4"
 
 using namespace std;
 
@@ -66,12 +68,21 @@ bool MusicPlayer::init(void)
 {
     if (bsp_extra_player_init() != ESP_OK) {
         ESP_LOGE(TAG, "Play init with SPIFFS failed");
-        return false;
+        // 允许继续启动，避免因无卡/无文件导致崩溃
+        return true;
+    }
+
+    struct stat st;
+    if (stat(MUSIC_DIR, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        ESP_LOGW(TAG, "Music directory not found: %s", MUSIC_DIR);
+        _file_iterator = NULL;
+        return true;
     }
 
     if (bsp_extra_file_instance_init(MUSIC_DIR, &_file_iterator) != ESP_OK) {
         ESP_LOGE(TAG, "bsp_extra_file_instance_init failed");
-        return false;
+        _file_iterator = NULL;
+        return true;
     }
 
     return true;

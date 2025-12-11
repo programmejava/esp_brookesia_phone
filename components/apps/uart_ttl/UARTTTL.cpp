@@ -34,10 +34,13 @@ const uart_stop_bits_t stopbits_options[] = {
 
 UARTTTL::UARTTTL() :
     ESP_Brookesia_PhoneApp("UART TTL", &img_app_uart_ttl, true),
+    _uart_service(),
     _update_timer(nullptr),
     _text_area_ttl(nullptr),
     _last_tx_timestamp(0),
     _current_text_len(0),
+    _current_config{},
+    _nvs_handle(0),            // 初始化为无效句柄，避免析构期误用
     _heartbeat_enabled(true),  // 默认开启心跳包功能
     _heartbeat_counter(0)      // 心跳包计数器初始化为0
 {

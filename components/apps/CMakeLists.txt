@@ -1,6 +1,13 @@
 set(APPS_DIR ./)
 file(GLOB_RECURSE APPS_C_SRCS ${APPS_DIR}/*.c)
 file(GLOB_RECURSE APPS_CPP_SRCS ${APPS_DIR}/*.cpp)
+# Ensure CMake reconfigures when new app sources are added (e.g., uart_bridge)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${APPS_DIR}/uart_bridge/UartBridge.cpp
+    ${APPS_DIR}/uart_bridge/UartBridge.hpp
+    ${APPS_DIR}/uart_bridge/UartBridgeOptions.hpp
+    ${APPS_DIR}/uart_bridge/ui/UartBridgeUI.cpp
+    ${APPS_DIR}/uart_bridge/ui/UartBridgeUI.hpp)
 
 idf_component_register(
     SRCS ${APPS_C_SRCS} ${APPS_CPP_SRCS}

@@ -19,6 +19,9 @@ public:
     size_t read(uint8_t *buffer, size_t max_len);
     size_t available();
     void write(const uint8_t *data, size_t len);
+    // 双消费者支持：桥接使用独立的缓冲区，避免 UI 抢占数据
+    size_t readBridge(uint8_t *buffer, size_t max_len);
+    size_t availableBridge();
     bool isConnected();
 
     // [新增] UI层调用的公共方法
@@ -85,12 +88,14 @@ private:
     volatile bool _heartbeat_task_should_stop;
 
     static RingbufHandle_t _s_rx_ring_buffer; 
+    static RingbufHandle_t _s_rx_ring_buffer_bridge;
     static volatile bool   _s_is_device_connected;
     static cdc_acm_dev_hdl_t _s_cdc_device_handle;
     
     // [新增] 设备信息
     static uint16_t _s_device_vid;
     static uint16_t _s_device_pid;
+    static UsbDeviceType _s_device_type; // 共享设备类型，便于多实例显示
     UsbDeviceType _current_device_type;
     
     // [新增] 保存当前串口配置

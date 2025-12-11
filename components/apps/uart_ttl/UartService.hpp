@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
 #include "driver/uart.h"
+#include <array>
 
 // 硬件配置定义
 // 已更新为由您最终选择的、接线方便的备用引脚
@@ -92,8 +93,22 @@ private:
      * @param arg 任务参数（UartService实例指针）
      */
     static void uartRxTask(void* arg);
+
+    // 注册/注销本实例的环形缓冲区为数据消费者
+    void registerConsumer();
+    void unregisterConsumer();
     
-    RingbufHandle_t _rx_ring_buffer;   // 接收数据环形缓冲区
-    TaskHandle_t    _rx_task_handle;   // 接收任务句柄
-    volatile bool   _is_running;       // 服务运行状态标志
+    // 静态共享资源：单一驱动、单一RX任务，扇出到多消费者（最多4个实例够用）
+    static inline bool s_driver_installed = false;
+    static inline bool s_rx_task_running = false;
+    static inline TaskHandle_t s_rx_task_handle = nullptr;
+    static inline SemaphoreHandle_t s_consumer_mux = nullptr;
+    struct ConsumerSlot {
+        RingbufHandle_t buf;
+        bool active;
+    };
+    static inline std::array<ConsumerSlot, 4> s_consumers = {};
+
+    RingbufHandle_t _rx_ring_buffer;   // 本实例的接收环形缓冲区（由共享RX任务填充）
+    volatile bool   _is_running;       // 仅控制本实例是否消费数据（保留接口兼容）
 };

@@ -116,7 +116,11 @@ void lv_demo_music(lv_obj_t *parent, file_iterator_instance_t *file_iterator)
 {
     _file_iterator = file_iterator;
 
-    active_track_cnt = file_iterator_get_count(_file_iterator);
+    if (_file_iterator) {
+        active_track_cnt = file_iterator_get_count(_file_iterator);
+    } else {
+        active_track_cnt = 0;
+    }
 
     original_screen_bg_color = lv_obj_get_style_bg_color(parent, 0);
     lv_obj_set_style_bg_color(parent, lv_color_hex(0x343247), 0);

@@ -12,10 +12,12 @@ static const char* TAG = "UsbCdcService";
 
 // 初始化静态成员变量
 RingbufHandle_t TinyUsbCdcService::_s_rx_ring_buffer = nullptr;
+RingbufHandle_t TinyUsbCdcService::_s_rx_ring_buffer_bridge = nullptr;
 volatile bool   TinyUsbCdcService::_s_is_device_connected = false;
 cdc_acm_dev_hdl_t TinyUsbCdcService::_s_cdc_device_handle = nullptr;
 uint16_t TinyUsbCdcService::_s_device_vid = 0;
 uint16_t TinyUsbCdcService::_s_device_pid = 0;
+TinyUsbCdcService::UsbDeviceType TinyUsbCdcService::_s_device_type = TinyUsbCdcService::DEVICE_TYPE_UNKNOWN;
 
 TinyUsbCdcService::TinyUsbCdcService() : 
     _host_task_handle(nullptr), 
@@ -42,35 +44,59 @@ bool TinyUsbCdcService::begin() {
     if (!_s_rx_ring_buffer) {
         _s_rx_ring_buffer = xRingbufferCreate(RX_RING_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF);
         if (!_s_rx_ring_buffer) { 
-            ESP_LOGE(TAG, "Failed to create ring buffer");
+            ESP_LOGE(TAG, "Failed to create ring buffer (UI)");
             return false; 
         }
     }
-    
+    if (!_s_rx_ring_buffer_bridge) {
+        _s_rx_ring_buffer_bridge = xRingbufferCreate(RX_RING_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF);
+        if (!_s_rx_ring_buffer_bridge) {
+            ESP_LOGE(TAG, "Failed to create ring buffer (bridge)");
+            return false;
+        }
+    }
+
     const usb_host_config_t host_config = { .intr_flags = ESP_INTR_FLAG_LEVEL1 };
-    if (usb_host_install(&host_config) != ESP_OK) {
-        ESP_LOGE(TAG, "USB Host install failed");
+    esp_err_t hret = usb_host_install(&host_config);
+    if (hret == ESP_ERR_INVALID_STATE) {
+        // 已安装则视为成功，避免卸载其他模块的 host
+        ESP_LOGW(TAG, "USB Host already installed, reuse existing instance");
+        hret = ESP_OK;
+    }
+    if (hret != ESP_OK) {
+        ESP_LOGE(TAG, "USB Host install failed: %s", esp_err_to_name(hret));
         return false;
     }
-    
+
     const cdc_acm_host_driver_config_t driver_config = {
         .driver_task_stack_size = 4096,
         .driver_task_priority = 5,
         .xCoreID = 0,
         .new_dev_cb = NULL // 我们使用自己的扫描任务，不使用这个回调
     };
-    if (cdc_acm_host_install(&driver_config) != ESP_OK) {
-        ESP_LOGE(TAG, "CDC ACM Host install failed");
+    esp_err_t dret = cdc_acm_host_install(&driver_config);
+    if (dret == ESP_ERR_INVALID_STATE) {
+        // 已安装则复用，不再卸载
+        ESP_LOGW(TAG, "CDC ACM already installed, reuse existing instance");
+        dret = ESP_OK;
+    }
+    if (dret != ESP_OK) {
+        ESP_LOGE(TAG, "CDC ACM Host install failed: %s", esp_err_to_name(dret));
         usb_host_uninstall();
         return false;
     }
 
-    if (xTaskCreate(host_lib_task, "usb_host_task", 4096, NULL, 5, &_host_task_handle) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create host_lib_task");
-        end();
-        return false;
+    // 避免重复创建 host 任务
+    if (_host_task_handle == nullptr) {
+        if (xTaskCreate(host_lib_task, "usb_host_task", 4096, NULL, 5, &_host_task_handle) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create host_lib_task");
+            end();
+            return false;
+        }
+    } else {
+        ESP_LOGW(TAG, "host_lib_task already running");
     }
-    
+
     ESP_LOGI(TAG, "USB Host Service initialized successfully");
     return true;
 }
@@ -99,6 +125,7 @@ void TinyUsbCdcService::end() {
     
     // 4. 清理设备状态
     _s_is_device_connected = false;
+    _s_device_type = DEVICE_TYPE_UNKNOWN;
     
     // 5. 卸载CDC驱动
     ESP_LOGI(TAG, "Uninstalling CDC ACM driver...");
@@ -123,9 +150,14 @@ void TinyUsbCdcService::end() {
     
     // 8. 最后清理ring buffer
     if (_s_rx_ring_buffer) {
-        ESP_LOGI(TAG, "Deleting ring buffer...");
+        ESP_LOGI(TAG, "Deleting ring buffer (UI)...");
         vRingbufferDelete(_s_rx_ring_buffer);
         _s_rx_ring_buffer = nullptr;
+    }
+    if (_s_rx_ring_buffer_bridge) {
+        ESP_LOGI(TAG, "Deleting ring buffer (bridge)...");
+        vRingbufferDelete(_s_rx_ring_buffer_bridge);
+        _s_rx_ring_buffer_bridge = nullptr;
     }
     
     ESP_LOGI(TAG, "USB Host Service deinitialized successfully");
@@ -482,6 +514,7 @@ void TinyUsbCdcService::device_scan_task(void *arg) {
                     _s_device_vid = common_vid_pid[i][0];
                     _s_device_pid = common_vid_pid[i][1];
                     self->_current_device_type = self->detectDeviceType(_s_device_vid, _s_device_pid);
+                    _s_device_type = self->_current_device_type; // 共享给其他实例用于展示
                     
                     ESP_LOGI(TAG, "Device type detected: %s", self->getDeviceTypeName());
                     
@@ -502,6 +535,9 @@ void TinyUsbCdcService::device_scan_task(void *arg) {
                     }
                     
                     if (!self->_scan_task_should_stop) {
+                        // 设备上线后立即按当前配置下发串口参数，避免热插拔后波特率复位导致乱码
+                        self->configureDeviceSpecific();
+
                         // 根据心跳包启用状态决定是否启动心跳
                         if (self->_heartbeat_enabled) {
                             self->startHeartbeat();
@@ -611,6 +647,7 @@ void TinyUsbCdcService::device_event_callback(const cdc_acm_host_dev_event_data_
                 _s_is_device_connected = false;
                 _s_device_vid = 0;
                 _s_device_pid = 0;
+                _s_device_type = DEVICE_TYPE_UNKNOWN;
                 
                 ESP_LOGI(TAG, "Device cleanup completed");
             }
@@ -640,6 +677,9 @@ void TinyUsbCdcService::device_event_callback(const cdc_acm_host_dev_event_data_
 bool TinyUsbCdcService::data_received_callback(const uint8_t *data, size_t data_len, void *user_ctx) {
     if (_s_rx_ring_buffer && data && data_len > 0) {
         xRingbufferSend(_s_rx_ring_buffer, data, data_len, (TickType_t)0);
+    }
+    if (_s_rx_ring_buffer_bridge && data && data_len > 0) {
+        xRingbufferSend(_s_rx_ring_buffer_bridge, data, data_len, (TickType_t)0);
     }
     return true;
 }
@@ -754,7 +794,9 @@ TinyUsbCdcService::UsbDeviceType TinyUsbCdcService::detectDeviceType(uint16_t vi
 }
 
 const char* TinyUsbCdcService::getDeviceTypeName() const {
-    switch (_current_device_type) {
+    // 若当前实例未检测到类型，则回退到全局已检测到的设备类型
+    UsbDeviceType type = (_current_device_type != DEVICE_TYPE_UNKNOWN) ? _current_device_type : _s_device_type;
+    switch (type) {
         case DEVICE_TYPE_CH340: return "CH340/CH341 (Non-standard)";
         case DEVICE_TYPE_FT232: return "FTDI FT232 (Proprietary)";
         case DEVICE_TYPE_CP210X: return "Silicon Labs CP210x (Standard CDC)";
@@ -910,4 +952,32 @@ void TinyUsbCdcService::setHeartbeatEnabled(bool enabled) {
 // [新增] 获取心跳包启用状态
 bool TinyUsbCdcService::isHeartbeatEnabled() const {
     return _heartbeat_enabled;
+}
+
+size_t TinyUsbCdcService::readBridge(uint8_t *buffer, size_t max_len) {
+    if (!_s_rx_ring_buffer_bridge || max_len == 0) return 0;
+    size_t item_size = 0;
+    uint8_t *item = (uint8_t*)xRingbufferReceive(_s_rx_ring_buffer_bridge, &item_size, (TickType_t)0);
+    if (item) {
+        size_t copy_len = (max_len < item_size) ? max_len : item_size;
+        memcpy(buffer, item, copy_len);
+        vRingbufferReturnItem(_s_rx_ring_buffer_bridge, (void*)item);
+        return copy_len;
+    }
+    return 0;
+}
+
+size_t TinyUsbCdcService::availableBridge() {
+    if (!_s_rx_ring_buffer_bridge) return 0;
+
+    UBaseType_t items_waiting = 0;
+    size_t free_bytes = 0;
+
+    vRingbufferGetInfo(_s_rx_ring_buffer_bridge, NULL, &free_bytes, NULL, NULL, &items_waiting);
+    if (items_waiting == 0) {
+        return 0;
+    }
+
+    size_t estimated_data = RX_RING_BUFFER_SIZE - free_bytes;
+    return (estimated_data > 0) ? estimated_data : 1;
 }

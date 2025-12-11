@@ -6,7 +6,6 @@ static const char* TAG = "UartService";
 
 UartService::UartService() : 
     _rx_ring_buffer(nullptr), 
-    _rx_task_handle(nullptr), 
     _is_running(false)
 {
 }
@@ -18,9 +17,6 @@ UartService::~UartService()
 
 void UartService::begin(const UartConfig& initial_config)
 {
-    // 先尝试删除可能残留的UART驱动实例（增加健壮性）
-    uart_driver_delete(UART_SERVICE_PORT);
-    
     // 配置UART参数
     uart_config_t uart_config = {
         .baud_rate = initial_config.baud_rate,
@@ -31,34 +27,41 @@ void UartService::begin(const UartConfig& initial_config)
         .source_clk = UART_SCLK_DEFAULT,
     };
     
-    ESP_LOGI(TAG, "Initializing UART on port %d: TX=%d, RX=%d, Baud=%d", 
-             UART_SERVICE_PORT, UART_SERVICE_TX_PIN, UART_SERVICE_RX_PIN, uart_config.baud_rate);
-    
-    // 安装UART驱动
-    ESP_ERROR_CHECK(uart_driver_install(UART_SERVICE_PORT, UART_DRIVER_BUF_SIZE, 0, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(UART_SERVICE_PORT, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(UART_SERVICE_PORT, UART_SERVICE_TX_PIN, UART_SERVICE_RX_PIN, 
-                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-
-    // 创建接收数据的环形缓冲区
-    _rx_ring_buffer = xRingbufferCreate(RX_RING_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF);
-    if (_rx_ring_buffer == nullptr) {
-        ESP_LOGE(TAG, "Failed to create ring buffer, halting service initialization");
-        uart_driver_delete(UART_SERVICE_PORT);
-        return;
+    // 初始化全局互斥
+    if (s_consumer_mux == nullptr) {
+        s_consumer_mux = xSemaphoreCreateMutex();
     }
 
-    // 创建UART接收任务
+    bool installed = uart_is_driver_installed(UART_SERVICE_PORT);
+    if (!installed) {
+        ESP_LOGI(TAG, "Installing shared UART driver (port=%d, TX=%d, RX=%d, baud=%d)",
+                 UART_SERVICE_PORT, UART_SERVICE_TX_PIN, UART_SERVICE_RX_PIN, uart_config.baud_rate);
+        ESP_ERROR_CHECK(uart_driver_install(UART_SERVICE_PORT, UART_DRIVER_BUF_SIZE, 0, 0, NULL, 0));
+        s_driver_installed = true;
+    }
+    // 参数配置（即使已安装也更新波特率等，但不改引脚以避免影响他方）
+    uart_param_config(UART_SERVICE_PORT, &uart_config);
+    if (!installed) {
+        uart_set_pin(UART_SERVICE_PORT, UART_SERVICE_TX_PIN, UART_SERVICE_RX_PIN,
+                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    }
+
+    // 注册消费者并启动共享RX任务（若未运行）
+    registerConsumer();
+    if (!_rx_ring_buffer) {
+        ESP_LOGE(TAG, "Failed to create ring buffer for this consumer");
+        return;
+    }
+    if (!s_rx_task_running) {
+        BaseType_t res = xTaskCreate(uartRxTask, "uart_rx_shared", 4096, nullptr, 10, &s_rx_task_handle);
+        if (res == pdPASS && s_rx_task_handle) {
+            s_rx_task_running = true;
+        } else {
+            ESP_LOGE(TAG, "Failed to start shared UART RX task");
+        }
+    }
+
     _is_running = false;
-    BaseType_t result = xTaskCreate(uartRxTask, "uart_rx_task", 4096, this, 10, &_rx_task_handle);
-    if (result != pdPASS || _rx_task_handle == nullptr) {
-        ESP_LOGE(TAG, "Failed to create UART RX task!");
-        vRingbufferDelete(_rx_ring_buffer);
-        _rx_ring_buffer = nullptr;
-        uart_driver_delete(UART_SERVICE_PORT);
-        return;
-    }
-
     ESP_LOGI(TAG, "UART service initialized successfully");
 }
 void UartService::end()
@@ -67,21 +70,9 @@ void UartService::end()
     
     // 停止接收
     _is_running = false;
-    
-    // 删除接收任务
-    if (_rx_task_handle) { 
-        vTaskDelete(_rx_task_handle); 
-        _rx_task_handle = nullptr; 
-    }
-    
-    // 删除环形缓冲区
-    if (_rx_ring_buffer) { 
-        vRingbufferDelete(_rx_ring_buffer); 
-        _rx_ring_buffer = nullptr; 
-    }
-    
-    // 卸载UART驱动
-    uart_driver_delete(UART_SERVICE_PORT);
+
+    // 注销消费者并删除本实例环形缓冲区
+    unregisterConsumer();
     
     ESP_LOGI(TAG, "UART service shut down successfully");
 }
@@ -90,19 +81,34 @@ void UartService::reconfigure(const UartConfig& new_config)
 {
     ESP_LOGI(TAG, "Reconfiguring UART service with new parameters");
     
-    // 停止并彻底清理旧的服务
-    if (_rx_task_handle) { 
-        vTaskDelete(_rx_task_handle); 
-        _rx_task_handle = nullptr; 
-    }
-    if (_rx_ring_buffer) { 
-        vRingbufferDelete(_rx_ring_buffer); 
-        _rx_ring_buffer = nullptr; 
-    }
-    uart_driver_delete(UART_SERVICE_PORT);
+    // 清理旧缓冲区并重新注册消费者
+    unregisterConsumer();
 
-    // 使用新配置重新初始化服务
-    begin(new_config);
+    uart_config_t uart_config = {
+        .baud_rate = new_config.baud_rate,
+        .data_bits = new_config.data_bits,
+        .parity = new_config.parity,
+        .stop_bits = new_config.stop_bits,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    // 驱动不存在则安装；存在则仅更新参数
+    bool installed = uart_is_driver_installed(UART_SERVICE_PORT);
+    if (!installed) {
+        ESP_LOGI(TAG, "Driver not installed, installing in reconfigure()");
+        ESP_ERROR_CHECK(uart_driver_install(UART_SERVICE_PORT, UART_DRIVER_BUF_SIZE, 0, 0, NULL, 0));
+        s_driver_installed = true;
+        ESP_ERROR_CHECK(uart_param_config(UART_SERVICE_PORT, &uart_config));
+        ESP_ERROR_CHECK(uart_set_pin(UART_SERVICE_PORT, UART_SERVICE_TX_PIN, UART_SERVICE_RX_PIN,
+                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    } else {
+        uart_param_config(UART_SERVICE_PORT, &uart_config);
+    }
+
+    // 重新注册本实例为消费者
+    registerConsumer();
+
     ESP_LOGI(TAG, "UART reconfiguration completed");
 }
 
@@ -154,34 +160,67 @@ void UartService::write(const uint8_t* data, size_t len)
 
 void UartService::uartRxTask(void* arg)
 {
-    UartService* self = static_cast<UartService*>(arg);
     uint8_t* buffer = (uint8_t*)malloc(UART_DRIVER_BUF_SIZE);
-    
     if (buffer == nullptr) {
         ESP_LOGE(TAG, "RX task failed to allocate memory, task exiting");
         vTaskDelete(NULL);
         return;
     }
 
-    ESP_LOGI(TAG, "UART RX task started");
+    ESP_LOGI(TAG, "Shared UART RX task started");
 
     while (true) {
-        if (self->_is_running) {
-            // 尝试读取UART数据（带超时）
-            int rx_len = uart_read_bytes(UART_SERVICE_PORT, buffer, UART_DRIVER_BUF_SIZE, pdMS_TO_TICKS(20));
-            if (rx_len > 0) {
-                // 将数据送入环形缓冲区
-                if (xRingbufferSend(self->_rx_ring_buffer, buffer, rx_len, (TickType_t)0) != pdTRUE) {
-                    ESP_LOGW(TAG, "Ring buffer full, %d bytes dropped", rx_len);
+        int rx_len = uart_read_bytes(UART_SERVICE_PORT, buffer, UART_DRIVER_BUF_SIZE, pdMS_TO_TICKS(20));
+        if (rx_len > 0) {
+            // 扇出给所有活跃消费者
+            if (s_consumer_mux) xSemaphoreTake(s_consumer_mux, portMAX_DELAY);
+            for (auto &slot : s_consumers) {
+                if (slot.active && slot.buf) {
+                    if (xRingbufferSend(slot.buf, buffer, rx_len, (TickType_t)0) != pdTRUE) {
+                        // 静默丢弃，避免刷屏；如需调试可加日志
+                    }
                 }
             }
+            if (s_consumer_mux) xSemaphoreGive(s_consumer_mux);
         } else {
-            // 未运行时休眠以节省CPU
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
-    
-    // 清理资源（理论上不会执行到这里）
-    free(buffer);
-    ESP_LOGI(TAG, "UART RX task ended");
+}
+
+void UartService::registerConsumer()
+{
+    // 创建本实例缓冲区
+    _rx_ring_buffer = xRingbufferCreate(RX_RING_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF);
+    if (!_rx_ring_buffer) {
+        ESP_LOGE(TAG, "Failed to create ring buffer for consumer");
+        return;
+    }
+    if (s_consumer_mux) xSemaphoreTake(s_consumer_mux, portMAX_DELAY);
+    for (auto &slot : s_consumers) {
+        if (!slot.active) {
+            slot.buf = _rx_ring_buffer;
+            slot.active = true;
+            break;
+        }
+    }
+    if (s_consumer_mux) xSemaphoreGive(s_consumer_mux);
+}
+
+void UartService::unregisterConsumer()
+{
+    if (s_consumer_mux) xSemaphoreTake(s_consumer_mux, portMAX_DELAY);
+    for (auto &slot : s_consumers) {
+        if (slot.active && slot.buf == _rx_ring_buffer) {
+            slot.active = false;
+            slot.buf = nullptr;
+            break;
+        }
+    }
+    if (s_consumer_mux) xSemaphoreGive(s_consumer_mux);
+
+    if (_rx_ring_buffer) {
+        vRingbufferDelete(_rx_ring_buffer);
+        _rx_ring_buffer = nullptr;
+    }
 }

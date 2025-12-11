@@ -12,6 +12,7 @@
 #include "esp_wifi.h"
 #include "lvgl.h"
 #include "esp_brookesia.hpp"
+#include "freertos/timers.h"
 
 class AppSettings: public ESP_Brookesia_PhoneApp {
 public:
@@ -93,6 +94,18 @@ private:
     static void onSliderPanelVolumeSwitchValueChangeEventCallback( lv_event_t * e);
     // Brightness
     static void onSliderPanelLightSwitchValueChangeEventCallback( lv_event_t * e);
+    // Backlight timeout dropdown
+    static void onDropdownBacklightTimeoutValueChangeEventCallback( lv_event_t * e);
+
+    // Backlight idle control
+    void handleBacklightIdleCheck();
+    void startBacklightTimer();
+    void stopBacklightTimer();
+    void restoreBacklight();
+    void turnOffBacklightForIdle();
+    static void backlightIdleTimerCallback(TimerHandle_t xTimer);
+    static int timeoutSecondsFromIndex(int idx);
+    static int timeoutIndexFromSeconds(int seconds);
 
     bool _is_ui_resumed;
     bool _is_ui_del;
@@ -101,8 +114,14 @@ private:
     lv_obj_t *_panel_wifi_connect;
     lv_obj_t *_spinner_wifi_connect;
     lv_obj_t *_img_wifi_connect;
+    lv_obj_t *_dropdown_backlight_timeout;
+    lv_obj_t *_label_backlight_timeout;
     std::array<lv_obj_t *, UI_MAX_INDEX> _screen_list;
     std::map<std::string, int32_t> _nvs_param_map;
     const ESP_Brookesia_StatusBar *status_bar; 
     const ESP_Brookesia_RecentsScreen *backstage;
+    TimerHandle_t _backlight_timer;
+    int _backlight_timeout_sec;
+    bool _backlight_off;
+    int _last_nonzero_brightness;
 };

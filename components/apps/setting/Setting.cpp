@@ -16,6 +16,7 @@
 #include "bsp/esp-bsp.h"
 #include "bsp_board_extra.h"
 #include "nvs.h"
+#include "freertos/timers.h"
 
 #include "ui/ui.h"
 #include "Setting.hpp"
@@ -40,7 +41,7 @@
 #define WIFI_CONNECT_UI_PANEL_SIZE      (1 * 1000)
 #define WIFI_CONNECT_RET_WAIT_TIME_MS   (10 * 1000)
 
-#define SCREEN_BRIGHTNESS_MIN           (20)
+#define SCREEN_BRIGHTNESS_MIN           (0)
 #define SCREEN_BRIGHTNESS_MAX           (BSP_LCD_BACKLIGHT_BRIGHTNESS_MAX)
 
 #define SPEAKER_VOLUME_MIN              (0)
@@ -51,6 +52,7 @@
 #define NVS_KEY_BLE_ENABLE              "ble_en"
 #define NVS_KEY_AUDIO_VOLUME            "volume"
 #define NVS_KEY_DISPLAY_BRIGHTNESS      "brightness"
+#define NVS_KEY_BACKLIGHT_TIMEOUT       "bl_timeout"
 
 #define UI_MAIN_ITEM_LEFT_OFFSET        (20)
 #define UI_WIFI_LIST_UP_OFFSET          (20)
@@ -86,7 +88,39 @@ static lv_obj_t* img_img_wifi_lock[SCAN_LIST_SIZE];
 static lv_obj_t* wifi_image[SCAN_LIST_SIZE];
 static lv_obj_t* wifi_connect[SCAN_LIST_SIZE];
 
-static int brightness;
+// Default to max brightness so first boot is visible; allow 0 to fully turn off.
+static int brightness = SCREEN_BRIGHTNESS_MAX;
+
+static int dropdown_timeout_values[] = {0, 30, 60, 120, 300};
+static const char *dropdown_timeout_options = "Never\n30s\n60s\n120s\n300s";
+
+static void apply_backlight_level(int level)
+{
+    if (level <= 0) {
+        bsp_display_backlight_off();
+    } else {
+        bsp_display_backlight_on();
+        bsp_display_brightness_set(level);
+    }
+}
+
+int AppSettings::timeoutSecondsFromIndex(int idx)
+{
+    if (idx < 0 || idx >= (int)(sizeof(dropdown_timeout_values) / sizeof(dropdown_timeout_values[0]))) {
+        return 0;
+    }
+    return dropdown_timeout_values[idx];
+}
+
+int AppSettings::timeoutIndexFromSeconds(int seconds)
+{
+    for (size_t i = 0; i < sizeof(dropdown_timeout_values) / sizeof(dropdown_timeout_values[0]); ++i) {
+        if (dropdown_timeout_values[i] == seconds) {
+            return (int)i;
+        }
+    }
+    return 0; // default to Never
+}
 
 LV_IMG_DECLARE(img_wifisignal_absent);
 LV_IMG_DECLARE(img_wifisignal_wake);
@@ -115,7 +149,20 @@ AppSettings::AppSettings():
     _is_ui_resumed(false),
     _is_ui_del(true),
     _screen_index(UI_MAIN_SETTING_INDEX),
-    _screen_list({nullptr})
+    _wifi_signal_strength_level(WIFI_SIGNAL_STRENGTH_NONE),
+    _panel_wifi_connect(nullptr),
+    _spinner_wifi_connect(nullptr),
+    _img_wifi_connect(nullptr),
+    _dropdown_backlight_timeout(nullptr),
+    _label_backlight_timeout(nullptr),
+    _screen_list({nullptr}),
+    _nvs_param_map(),
+    status_bar(nullptr),
+    backstage(nullptr),
+    _backlight_timer(nullptr),
+    _backlight_timeout_sec(0),
+    _backlight_off(false),
+    _last_nonzero_brightness(SCREEN_BRIGHTNESS_MAX)
 {
 }
 
@@ -196,14 +243,21 @@ bool AppSettings::init(void)
     // _nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS] = bsp_display_brightness_get();
     _nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS] = brightness;
     _nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS] = max(min((int)_nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS], SCREEN_BRIGHTNESS_MAX), SCREEN_BRIGHTNESS_MIN);
+    _nvs_param_map[NVS_KEY_BACKLIGHT_TIMEOUT] = 0; // seconds, 0 = never
     // Load NVS parameters if exist
     loadNvsParam();
     // Update System parameters
     bsp_extra_codec_volume_set(_nvs_param_map[NVS_KEY_AUDIO_VOLUME], (int *)&_nvs_param_map[NVS_KEY_AUDIO_VOLUME]);
-    bsp_display_brightness_set(_nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS]);
+    apply_backlight_level(_nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS]);
+    if (_nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS] > 0) {
+        _last_nonzero_brightness = _nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS];
+    }
+    _backlight_timeout_sec = _nvs_param_map[NVS_KEY_BACKLIGHT_TIMEOUT];
 
     xTaskCreate(euiRefresTask, "Home Refresh", HOME_REFRESH_TASK_STACK_SIZE, this, HOME_REFRESH_TASK_PRIORITY, NULL);
     xTaskCreate(wifiScanTask, "WiFi Scan", WIFI_SCAN_TASK_STACK_SIZE, this, WIFI_SCAN_TASK_PRIORITY, NULL);
+
+    startBacklightTimer();
 
     return true;
 }
@@ -326,6 +380,18 @@ void AppSettings::extraUiInit(void)
     lv_slider_set_range(ui_SliderPanelScreenSettingLightSwitch1, SCREEN_BRIGHTNESS_MIN, SCREEN_BRIGHTNESS_MAX);
     lv_obj_add_event_cb(ui_SliderPanelScreenSettingLightSwitch1, onSliderPanelLightSwitchValueChangeEventCallback,
                         LV_EVENT_VALUE_CHANGED, this);
+
+    _label_backlight_timeout = lv_label_create(ui_ScreenSettingLight);
+    lv_label_set_text(_label_backlight_timeout, "Screen off");
+    lv_obj_align_to(_label_backlight_timeout, ui_PanelScreenSettingLightSwitch, LV_ALIGN_OUT_BOTTOM_LEFT, 10, 20);
+
+    _dropdown_backlight_timeout = lv_dropdown_create(ui_ScreenSettingLight);
+    lv_dropdown_set_options_static(_dropdown_backlight_timeout, dropdown_timeout_options);
+    lv_obj_set_width(_dropdown_backlight_timeout, 140);
+    lv_obj_align_to(_dropdown_backlight_timeout, _label_backlight_timeout, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+    lv_obj_add_event_cb(_dropdown_backlight_timeout, onDropdownBacklightTimeoutValueChangeEventCallback,
+                        LV_EVENT_VALUE_CHANGED, this);
+
     lv_obj_add_flag(ui_ButtonScreenSettingLightReturn, LV_OBJ_FLAG_HIDDEN);
     // Record the screen index and install the screen loaded event callback
     _screen_list[UI_BRIGHTNESS_SETTING_INDEX] = ui_ScreenSettingLight;
@@ -468,6 +534,10 @@ void AppSettings::updateUiByNvsParam(void)
 
     lv_slider_set_value(ui_SliderPanelScreenSettingLightSwitch1, _nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS], LV_ANIM_OFF);
     lv_slider_set_value(ui_SliderPanelScreenSettingVolumeSwitch, _nvs_param_map[NVS_KEY_AUDIO_VOLUME], LV_ANIM_OFF);
+
+    if (_dropdown_backlight_timeout) {
+        lv_dropdown_set_selected(_dropdown_backlight_timeout, timeoutIndexFromSeconds(_nvs_param_map[NVS_KEY_BACKLIGHT_TIMEOUT]));
+    }
 }
 
 esp_err_t AppSettings::initWifi()
@@ -830,6 +900,84 @@ void AppSettings::wifiEventHandler(void* arg, esp_event_base_t event_base, int32
     }
 }
 
+void AppSettings::startBacklightTimer()
+{
+    if (_backlight_timer) {
+        return;
+    }
+
+    _backlight_timer = xTimerCreate("bl_idle", pdMS_TO_TICKS(500), pdTRUE, this, backlightIdleTimerCallback);
+    if (_backlight_timer == nullptr) {
+        ESP_LOGE(TAG, "Failed to create backlight idle timer");
+        return;
+    }
+
+    if (xTimerStart(_backlight_timer, 0) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start backlight idle timer");
+    }
+}
+
+void AppSettings::stopBacklightTimer()
+{
+    if (_backlight_timer) {
+        xTimerStop(_backlight_timer, 0);
+        xTimerDelete(_backlight_timer, 0);
+        _backlight_timer = nullptr;
+    }
+}
+
+void AppSettings::turnOffBacklightForIdle()
+{
+    apply_backlight_level(0);
+    _backlight_off = true;
+}
+
+void AppSettings::restoreBacklight()
+{
+    int level = _last_nonzero_brightness > 0 ? _last_nonzero_brightness : SCREEN_BRIGHTNESS_MIN;
+    apply_backlight_level(level);
+    _backlight_off = false;
+}
+
+void AppSettings::handleBacklightIdleCheck()
+{
+    if (_backlight_timeout_sec <= 0) {
+        if (_backlight_off) {
+            restoreBacklight();
+        }
+        return;
+    }
+
+    lv_disp_t *disp = lv_disp_get_default();
+    if (disp == nullptr) {
+        return;
+    }
+
+    uint32_t inactive_ms = 0;
+    if (bsp_display_lock(0)) {
+        inactive_ms = lv_disp_get_inactive_time(disp);
+        bsp_display_unlock();
+    } else {
+        return;
+    }
+
+    if (!_backlight_off && inactive_ms >= (uint32_t)_backlight_timeout_sec * 1000) {
+        turnOffBacklightForIdle();
+    } else if (_backlight_off && inactive_ms < 200) {
+        restoreBacklight();
+    }
+}
+
+void AppSettings::backlightIdleTimerCallback(TimerHandle_t xTimer)
+{
+    AppSettings *app = (AppSettings *)pvTimerGetTimerID(xTimer);
+    if (app == nullptr) {
+        return;
+    }
+
+    app->handleBacklightIdleCheck();
+}
+
 void AppSettings::onKeyboardScreenSettingVerificationClickedEventCallback(lv_event_t *e)
 {
     AppSettings *app = (AppSettings *)lv_event_get_user_data(e);
@@ -974,11 +1122,9 @@ void AppSettings::onSliderPanelLightSwitchValueChangeEventCallback( lv_event_t *
     ESP_BROOKESIA_CHECK_NULL_GOTO(app, end, "Invalid app pointer");
 
     if (brightness != app->_nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS]) {
-        // if ((bsp_display_brightness_set(brightness) != ESP_OK) && (bsp_display_brightness_get() != brightness)) {
-        if (bsp_display_brightness_set(brightness) != ESP_OK) {
-            ESP_LOGE(TAG, "Set brightness failed");
-            lv_slider_set_value(ui_SliderPanelScreenSettingLightSwitch1, app->_nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS], LV_ANIM_OFF);
-            return;
+        apply_backlight_level(brightness);
+        if (brightness > 0) {
+            app->_last_nonzero_brightness = brightness;
         }
         app->_nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS] = brightness;
         app->setNvsParam(NVS_KEY_DISPLAY_BRIGHTNESS, brightness);
@@ -986,4 +1132,20 @@ void AppSettings::onSliderPanelLightSwitchValueChangeEventCallback( lv_event_t *
 
 end:
     return;
+}
+
+void AppSettings::onDropdownBacklightTimeoutValueChangeEventCallback( lv_event_t * e) {
+    AppSettings *app = (AppSettings *)lv_event_get_user_data(e);
+    if (app == nullptr) {
+        return;
+    }
+
+    int idx = lv_dropdown_get_selected(app->_dropdown_backlight_timeout);
+    int new_timeout = timeoutSecondsFromIndex(idx);
+    if (new_timeout != app->_backlight_timeout_sec) {
+        app->_backlight_timeout_sec = new_timeout;
+        app->_nvs_param_map[NVS_KEY_BACKLIGHT_TIMEOUT] = new_timeout;
+        app->setNvsParam(NVS_KEY_BACKLIGHT_TIMEOUT, new_timeout);
+        app->restoreBacklight();
+    }
 }

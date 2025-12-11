@@ -73,7 +73,15 @@ extern "C" void app_main(void)
 
     MusicPlayer *music_player = new MusicPlayer();
     assert(music_player != nullptr && "Failed to create music_player");
-    assert((phone->installApp(music_player) >= 0) && "Failed to begin music_player");
+    if (phone->installApp(music_player) < 0) {
+        ESP_LOGW(TAG, "Failed to install music_player");
+    }
+
+    UartBridge *uart_bridge = new UartBridge();
+    assert(uart_bridge != nullptr && "Failed to create uart_bridge");
+    if (phone->installApp(uart_bridge) < 0) {
+        ESP_LOGW(TAG, "Failed to install uart_bridge");
+    }
 
     AppSettings *app_settings = new AppSettings();
     assert(app_settings != nullptr && "Failed to create app_settings");

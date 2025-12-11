@@ -12,3 +12,4 @@
 //#include "my_music_player/MyMusicPlayer.hpp"
 #include "uart_usb/USB_CDC.hpp"
 #include "power_controller/PowerController.hpp"
+#include "uart_bridge/UartBridge.hpp"
