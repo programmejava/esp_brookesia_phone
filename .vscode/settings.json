@@ -1,0 +1,9 @@
+{
+    "files.associations": {
+        "esp_brookesia.h": "c",
+        "ui_events.h": "c",
+        "ui.h": "c",
+        "ui_helpers.h": "c",
+        "lvgl.h": "c"
+    }
+}
